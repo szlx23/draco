@@ -2,7 +2,7 @@ import os
 import subprocess
 from pathlib import Path
 
-from anthropic.types import ToolParam
+from anthropic.types import ToolUseBlock
 
 # macOS 的 libedit 在处理中文输入时有退格问题，这四行修复它
 try:
@@ -24,14 +24,14 @@ if os.getenv("ANTHROPIC_BASE_URL"):
     os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
 
-WORKDIR = os.cwd()
+WORKDIR = Path.cwd()
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
 
-// 系统提示词
+# 系统提示词
 SYSTEM = f"You are a coding agent at {os.getcwd()}. Use bash to solve tasks. Act, don't explain."
 
-// 工具函数
+# 工具函数
 def run_bash(command: str) -> str:
     dangerous_command = [
         "rm -rf /",
@@ -51,25 +51,55 @@ def run_bash(command: str) -> str:
     except (FileNotFoundError, OSError) as e:
         return f"Error: {e}"
 
-def safe_path(p -> str) -> Path {
+def safe_path(p: str) -> Path :
     path = (WORKDIR / p).resolve()
     if not path.is_relative_to(WORKDIR):
         raise ValueError(f"Path escapes workspace: {p}")
     return path
-}
+
 
 def run_read(path: str, limit: int | None = None) -> str:
     try:
-        lines = safe_path(str).read_text().splitlines()
+        lines = safe_path(path).read_text().splitlines()
         if limit and limit < len(lines):
             lines = lines[:limit] + [f"... ({len(lines) - limit} more lines)"]
         return "\n".join(lines)
     except Exception as e:
         return f"Error: {e}"
 
+def run_write(path: str, content: str):
+    try:
+        file_path = safe_path(path)
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text(content)
+        return f"Wrote {len(content)} bytes to {path}"
+    except Exception as e:
+        return f"Error: {e}"
 
-// 工具定义
-TOOLS: list[ToolParam] = [
+def run_edit(path: str, old_text: str, new_text:str):
+    try:
+        file_path = safe_path(path)
+        text = file_path.read_text()
+        if old_text not in text:
+            return f"Error: text not found in {path}"
+        file_path.write_text(text.replace(old_text, new_text))
+    except Exception as e:
+        return f"Error: {e}"
+
+def run_glob(pattern: str):
+    import glob as g
+    try:
+        results = []
+        for match in g.glob(pattern, root_dir=WORKDIR):
+            if (WORKDIR / match).resolve().is_relative_to(WORKDIR):
+                results.append(match)
+        return "\n".join(results) if results else "(No Match)"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# 工具定义
+TOOLS: list = [
     {
         "name": "bash",
         "description": "Run a bash command",
@@ -89,10 +119,14 @@ TOOLS: list[ToolParam] = [
         "input_schema": {
             "type": "object",
             "properties": {
-                "path": "string",
-                "limit": "integer",
+                "path": {
+                    "type": "string",
+                },
+                "limit": {
+                    "type": "integer",
+                }
             },
-        }
+        },
         "required": ["path"],
     },
     {
@@ -101,10 +135,14 @@ TOOLS: list[ToolParam] = [
         "input_schema": {
             "type": "object",
             "properties": {
-                "path": "string",
-                "content": "string",
+                "path": {
+                    "type": "string",
+                },
+                "content": {
+                    "type": "string",
+                },
             },
-        }
+        },
         "required": ["path", "content"],
     },
     {
@@ -113,11 +151,17 @@ TOOLS: list[ToolParam] = [
         "input_schema": {
             "type": "object",
             "properties": {
-                "path": "string",
-                "old_text": "string",
-                "new_text": "string",
+                "path": {
+                    "type": "string",
+                },
+                "old_text": {
+                    "type": "string",
+                },
+                "new_text": {
+                    "type": "string",
+                },
             },
-        }
+        },
         "required": ["path", "old_text", "new_text"],
     },
     {
@@ -126,20 +170,29 @@ TOOLS: list[ToolParam] = [
         "input_schema": {
             "type": "object",
             "properties": {
-                "pattern": "string",
+                "pattern": {
+                    "type": "string",
+                },
             },
-        }
+        },
         "required": ["pattern"],
     },
 ]
 
 
-
+# 工具分发
+TOOL_HANDLERS = {
+    "bash": run_bash,
+    "read": run_read,
+    "write": run_write,
+    "edit": run_edit,
+    "glob": run_glob,
+}
 
 def agent_loop(messages: list):
     while True:
         response = client.messages.create(
-            model = MODEL, system=SYSTEM, messages=messages,
+            model=MODEL, system=SYSTEM, messages=messages,
             tools=TOOLS, max_tokens=8000
         )
 
@@ -150,10 +203,11 @@ def agent_loop(messages: list):
 
         result = []
         for block in response.content:
-            if block.type == "tool_use":
-                print(f"\033[33m$ {block.input['command']}\033[0m")
-                output = run_bash(str(block.input['command']))
-                print(output[:200])
+            if isinstance(block, ToolUseBlock):
+                print(f"\033[33m$ {block.name}\033[0m")
+                handler = TOOL_HANDLERS.get(block.name)
+                output = handler(**block.input) if handler else f"Unknown: {block.name}"
+                print((output or "")[:200])
                 result.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
@@ -172,6 +226,9 @@ if __name__ == "__main__":
         try:
             query = input("\033[36ms01 >> \033[0m")
         except (EOFError, KeyboardInterrupt):
+            break
+
+        if query == "q":
             break
 
         history.append({"role": "user", "content": query})
